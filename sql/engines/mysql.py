@@ -1,4 +1,5 @@
 # -*- coding: UTF-8 -*-
+import json
 import logging
 import traceback
 import MySQLdb
@@ -9,6 +10,7 @@ import sqlparse
 from MySQLdb.constants import FIELD_TYPE
 from schemaobject.connection import build_database_url
 
+from common.utils.timer import FuncTimer
 from sql.engines.goinception import GoInceptionEngine
 from sql.utils.sql_utils import get_syntax_type, remove_comments
 from . import EngineBase
@@ -446,11 +448,53 @@ class MysqlEngine(EngineBase):
             )
             result.error = ("实例read_only=1，禁止执行变更语句!",)
             return result
-        # TODO 原生执行
-        # if workflow.is_manual == 1:
-        #     return self.execute(db_name=workflow.db_name, sql=workflow.sqlworkflowcontent.sql_content)
+        # 原生执行
+        if workflow.is_manual == 1:
+            return self.direct_execute_workflow(workflow)
         # inception执行
-        return self.inc_engine.execute(workflow)
+        else:
+            return self.inc_engine.execute(workflow)
+
+    def direct_execute_workflow(self, workflow):
+        """直接连接MySQL执行"""
+        execute_result = ReviewSet(sql=workflow.content)
+        execute_result.backup_status = "否"
+        conn = self.get_connection()
+        conn.autocommit(1)
+        cursor = conn.cursor()
+        # 防止元数据锁阻塞DML语句
+        cursor.execute("set session lock_wait_timeout=10;")
+
+        status = 0
+        for row in json.loads(workflow.review_content):
+            # 兼容旧格式
+            row_result = ReviewResult(**row)
+            try:
+                if status != 0:
+                    raise ValueError("前序语句失败")
+                with FuncTimer() as t:
+                    affected_rows = cursor.execute(row_result.sql)
+                row_result.stagestatus = cursor.fetchall() or "Execute Successfully"
+                row_result.errormessage = "None"
+                row_result.errlevel = 0
+                row_result.affected_rows = affected_rows
+                row_result.execute_time = t.cost
+            except ValueError as e:
+                row_result.stagestatus = "Audit completed"
+                row_result.errormessage = "前序语句失败，未执行，请重新提交"
+                row_result.errlevel = 2
+            except Exception as e:
+                # 记录异常信息
+                status = 1
+                execute_result.error = str(e)
+                row_result.stagestatus = "Execute Failed"
+                row_result.errlevel = 2
+                row_result.errormessage = "异常信息：{}".format(str(e))
+                execute_result.error_count += 1
+            finally:
+                execute_result.rows += [row_result]
+        self.close()
+        return execute_result
 
     def execute(self, db_name=None, sql="", close_conn=True):
         """原生执行语句"""
